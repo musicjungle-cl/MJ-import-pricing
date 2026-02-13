@@ -1,18 +1,21 @@
-# app.py
-# Streamlit app — Pricing Inteligente MJ (Importaciones)
-# Permite: pegar tabla de productos + ingresar cargos (shipping + aduana/IVA/servicios) + elegir fórmula
-# Devuelve: landed cost + precios sugeridos por SKU + brechas vs precio base (2.2)
+# app.py — Pricing Importaciones (MJ) v2.0
+# Cambios v2.0:
+# 1) Landed CLP unit SIN IVA (separa IVA importación y IVA servicios)
+# 2) Fórmula de pricing por defecto: (Costo * 1,7) + IVA  => Costo * 1.7 * (1+IVA)
+# 3) Precios CLP sin decimales
+# 4) Redondeos siempre terminan en "900" (…900, …1900, …2900, etc.)
+# 5) Resumen final: costo total carga + venta total por escenario + margen % con y sin IVA
 
 import io
 import re
-import pandas as pd
 import numpy as np
+import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Pricing Importaciones — Music Jungle", layout="wide")
+st.set_page_config(page_title="Pricing Importaciones — Music Jungle (v2.0)", layout="wide")
 
 # -----------------------------
-# Helpers
+# Constantes / Defaults
 # -----------------------------
 FORMATS = ["CD", "Cassette", "LP simple", "LP doble", "Box"]
 ROTATIONS = ["Alta", "Media", "Baja"]
@@ -26,26 +29,23 @@ DEFAULT_RATIOS = {
     "Box": 3.2,
 }
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def normalize_money(x):
-    """Accepts '14,95' or '14.95' or '1.234,56' etc."""
+    """Parse '14,95' or '14.95' or '1.234,56' etc. -> float."""
     if pd.isna(x):
         return np.nan
     s = str(x).strip()
     if s == "":
         return np.nan
-    # remove currency symbols and spaces
     s = re.sub(r"[^\d,.\-]", "", s)
-    # if both separators exist, assume thousands + decimal
     if "," in s and "." in s:
-        # decide decimal separator as last occurrence
         if s.rfind(",") > s.rfind("."):
-            # '.' thousands, ',' decimal
             s = s.replace(".", "").replace(",", ".")
         else:
-            # ',' thousands, '.' decimal
             s = s.replace(",", "")
     else:
-        # only comma: treat as decimal
         if "," in s:
             s = s.replace(".", "").replace(",", ".")
     try:
@@ -55,31 +55,30 @@ def normalize_money(x):
 
 def parse_pasted_table(text: str) -> pd.DataFrame:
     """
-    Expects TSV (tab-separated) like:
-    Origen\tProducto\tFormato\tQty\tMoneda\tCosto unit\tRotación\tMercado
-    or minimal:
-    Producto\tFormato\tQty\tMoneda\tCosto unit
+    Acepta TSV (recomendado) o CSV.
+    Columnas esperadas:
+      Origen, Producto, Formato, Qty, Moneda, Costo unit, Rotación, Mercado
+    Mínimas:
+      Producto, Formato, Qty, Moneda, Costo unit
     """
     text = (text or "").strip()
     if not text:
         return pd.DataFrame()
 
-    # Try TSV first
+    # TSV primero
     try:
         df = pd.read_csv(io.StringIO(text), sep="\t", dtype=str)
         if df.shape[1] <= 1:
             raise ValueError("Not TSV")
     except Exception:
-        # fallback: CSV with commas
         df = pd.read_csv(io.StringIO(text), sep=",", dtype=str)
 
-    # Trim columns
     df.columns = [c.strip() for c in df.columns]
 
-    # Map common column names to expected schema
+    # Map nombres comunes
     colmap = {}
     for c in df.columns:
-        cl = c.lower()
+        cl = c.lower().strip()
         if cl in ["origen", "origin"]:
             colmap[c] = "Origen"
         elif cl in ["producto", "product", "artist-title", "artist - title", "title"]:
@@ -99,7 +98,7 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
 
     df = df.rename(columns=colmap)
 
-    # Ensure required columns exist
+    # Asegurar columnas
     for needed in ["Producto", "Formato", "Qty", "Moneda", "Costo unit"]:
         if needed not in df.columns:
             df[needed] = ""
@@ -111,54 +110,68 @@ def parse_pasted_table(text: str) -> pd.DataFrame:
     if "Mercado" not in df.columns:
         df["Mercado"] = ""
 
-    # Normalize
     df["Origen"] = df["Origen"].fillna("Importado").replace("", "Importado")
     df["Producto"] = df["Producto"].fillna("").astype(str).str.strip()
     df["Formato"] = df["Formato"].fillna("").astype(str).str.strip()
     df["Moneda"] = df["Moneda"].fillna("").astype(str).str.strip().str.upper()
+
     df["Qty"] = df["Qty"].apply(normalize_money).fillna(0).astype(int)
     df["Costo unit"] = df["Costo unit"].apply(normalize_money)
 
-    # Standardize formats: accept LP / 2-LP / 2LP / CD / 2-CD etc.
     def std_fmt(x):
         s = str(x).strip().upper()
         if s in ["LP", "1LP", "VINYL", "VINILO"]:
             return "LP simple"
-        if s in ["2-LP", "2LP", "2 LP", "2XLP", "DOUBLE LP"]:
+        if s in ["2-LP", "2LP", "2 LP", "2XLP", "DOUBLE LP", "3-LP", "3LP", "3 LP", "3XLP", "TRIPLE LP"]:
             return "LP doble"
-        if s in ["CD", "1CD"]:
+        if s in ["CD", "1CD", "DISC"]:
             return "CD"
-        if s in ["2-CD", "2CD", "2 CD", "2XCD", "DOUBLE CD"]:
-            return "CD"  # operativamente lo tratamos como CD liviano
+        if s in ["2-CD", "2CD", "2 CD", "2XCD", "DOUBLE CD", "3-CD", "3CD", "3 CD", "3XCD"]:
+            return "CD"
         if s in ["CASSETTE", "TAPE"]:
             return "Cassette"
         if s in ["BOX", "BOXSET"]:
             return "Box"
-        # already in target?
         if x in FORMATS:
             return x
         return x if x else "LP simple"
 
     df["Formato"] = df["Formato"].apply(std_fmt)
-
-    # Clean rotations/markets
     df["Rotación"] = df["Rotación"].astype(str).str.strip()
     df["Mercado"] = df["Mercado"].astype(str).str.strip()
-
     return df
+
+def fx_to_clp(currency: str, amount: float, usdclp: float, eurclp: float) -> float:
+    if pd.isna(amount):
+        return np.nan
+    c = (currency or "").upper().strip()
+    if c == "USD":
+        return float(amount) * float(usdclp)
+    if c == "EUR":
+        return float(amount) * float(eurclp)
+    return float(amount)
 
 def compute_ratio(fmt: str, ratio_map: dict) -> float:
     return float(ratio_map.get(fmt, 1.0))
 
-def round_up(price_clp: float, step: int) -> float:
-    if price_clp is None or np.isnan(price_clp) or price_clp <= 0:
-        return 0.0
-    return float(int(np.ceil(price_clp / step) * step))
+def round_to_900_up(x: float) -> int:
+    """
+    Redondea hacia arriba a valores terminados en 900:
+      15.200 -> 15.900
+      15.900 -> 15.900
+      15.901 -> 16.900
+    """
+    if x is None or np.isnan(x) or x <= 0:
+        return 0
+    step = 1000
+    base = 900
+    # ceil((x - base)/step)
+    n = int(np.ceil((float(x) - base) / step))
+    return int(base + n * step)
 
 def matrix_adjustment(origen: str, ratio: float, rot: str, market: str) -> float:
     """
-    Ajustes basados en la matriz que definimos.
-    Retorna % (ej: -0.10, +0.08)
+    Ajustes % según matriz MJ (simple).
     """
     origen = (origen or "").strip()
     rot = (rot or "").strip()
@@ -175,7 +188,6 @@ def matrix_adjustment(origen: str, ratio: float, rot: str, market: str) -> float
             return 0.08
         return 0.00
 
-    # Local (si quisieras usarlo acá también)
     if origen == "Local":
         if rot == "Alta" and market == "Price-taker":
             return -0.05
@@ -188,30 +200,31 @@ def matrix_adjustment(origen: str, ratio: float, rot: str, market: str) -> float
 # -----------------------------
 # UI
 # -----------------------------
-st.title("Pricing Importaciones — Music Jungle")
-st.caption("Pega la tabla de productos + ingresa cargos (shipping / aduana / IVA / servicios) y obtén landed cost y precios sugeridos.")
+st.title("Pricing Importaciones — Music Jungle (v2.0)")
+st.caption("Pega la tabla de productos + ingresa cargos (shipping / aduana / IVA / servicios). "
+           "Calcula landed SIN IVA y precios sugeridos con redondeo a …900.")
 
 with st.sidebar:
     st.header("1) Parámetros")
     colfx1, colfx2 = st.columns(2)
     usdclp = colfx1.number_input("USD → CLP", min_value=1.0, value=950.0, step=1.0)
     eurclp = colfx2.number_input("EUR → CLP", min_value=1.0, value=1150.0, step=1.0)
-
     iva_cl = st.number_input("IVA Chile", min_value=0.0, max_value=0.30, value=0.19, step=0.01)
-    rounding_step = st.number_input("Redondeo (CLP)", min_value=1, value=900, step=100)
 
     st.divider()
     st.header("2) Fórmula de pricing")
-    pricing_mode = st.selectbox(
-        "Modo de recomendación",
+    formula = st.selectbox(
+        "Fórmula base",
         [
-            "Seguir fórmula base (2,2) + Matriz (ajuste)",
-            "Proteger margen (GM objetivo sobre landed)",
-            "Comparar ambos (y recomendar el mayor)",
+            "MJ 1,7 + IVA (default)",
+            "Importado 2,2 (IVA incl.)",
+            "GM objetivo sobre landed (sin IVA)",
+            "Comparar (elegir el mayor)",
         ],
-        index=2
+        index=0
     )
-    mult_import = st.number_input("Multiplicador importado (IVA incl.)", min_value=0.5, value=2.2, step=0.05)
+    mult_mj = st.number_input("Multiplicador MJ (sobre costo sin IVA)", min_value=0.5, value=1.7, step=0.05)
+    mult_import = st.number_input("Multiplicador 2,2 (sobre costo origen)", min_value=0.5, value=2.2, step=0.05)
     gm_target = st.number_input("GM objetivo (si aplica)", min_value=0.10, max_value=0.90, value=0.45, step=0.01)
 
     st.divider()
@@ -220,33 +233,30 @@ with st.sidebar:
 
     st.divider()
     st.header("4) Ratios (peso operativo)")
-    st.caption("Ajusta solo si quieres afinar tu prorrateo.")
     ratio_map = {}
     for k in FORMATS:
         ratio_map[k] = st.number_input(f"Ratio {k}", min_value=0.01, value=float(DEFAULT_RATIOS[k]), step=0.05)
 
 st.subheader("Pega la tabla de productos")
-st.caption("Formato recomendado (TSV): Origen, Producto, Formato, Qty, Moneda, Costo unit, Rotación, Mercado. "
-           "También funciona con columnas mínimas: Producto, Formato, Qty, Moneda, Costo unit.")
+st.caption("TSV recomendado: Origen, Producto, Formato, Qty, Moneda, Costo unit, Rotación, Mercado. "
+           "También sirve con columnas mínimas: Producto, Formato, Qty, Moneda, Costo unit.")
 
 default_example = (
     "Origen\tProducto\tFormato\tQty\tMoneda\tCosto unit\tRotación\tMercado\n"
-    "Importado\tAir – Virgin Suicides Redux\tLP simple\t2\tEUR\t18,50\tMedia\tPrice-taker\n"
-    "Importado\tLeftfield – Leftism\tLP doble\t2\tEUR\t27,50\tAlta\tPrice-taker\n"
-    "Importado\tBeastie Boys – Ill Communication\tCD\t2\tEUR\t5,45\tAlta\tPrice-taker\n"
+    "Importado\tAqua – Aquarium\tLP simple\t2\tEUR\t14,95\tMedia\tPrice-taker\n"
+    "Importado\tJamiroquai – High Times: Tour Edition\tLP doble\t3\tEUR\t27,50\tAlta\tPrice-taker\n"
+    "Importado\tPixies – Surfer Rosa / Come On Pilgrim\tCD\t2\tEUR\t9,50\tAlta\tPrice-taker\n"
 )
 
 pasted = st.text_area("Tabla pegada", height=180, value=default_example)
-
 df = parse_pasted_table(pasted)
 
 st.subheader("Cargos / costos adicionales")
 colc1, colc2, colc3, colc4 = st.columns(4)
-
 shipping_currency = colc1.selectbox("Moneda shipping internacional", ["EUR", "USD"], index=0)
 shipping_amount = colc2.number_input("Shipping internacional (monto)", min_value=0.0, value=0.0, step=1.0)
 
-# Costos locales CLP (aduana, IVA importación, servicios, etc.)
+# Costos locales (CLP)
 iva_import = colc3.number_input("IVA importación (CLP)", min_value=0.0, value=0.0, step=1000.0)
 derechos = colc4.number_input("Derechos / arancel (CLP)", min_value=0.0, value=0.0, step=1000.0)
 
@@ -256,135 +266,230 @@ iva_servicios = colc6.number_input("IVA servicios (CLP)", min_value=0.0, value=0
 transporte_local = colc7.number_input("Transporte local (CLP)", min_value=0.0, value=0.0, step=1000.0)
 otros = colc8.number_input("Otros (CLP)", min_value=0.0, value=0.0, step=1000.0)
 
-# -----------------------------
-# Compute
-# -----------------------------
+st.divider()
+
 if df.empty:
     st.warning("Pega una tabla válida para comenzar.")
     st.stop()
 
-# Convert origin unit cost to CLP
-def fx_to_clp(currency: str, amount: float) -> float:
-    if pd.isna(amount):
-        return np.nan
-    c = (currency or "").upper().strip()
-    if c == "USD":
-        return float(amount) * float(usdclp)
-    if c == "EUR":
-        return float(amount) * float(eurclp)
-    # fallback assume CLP already
-    return float(amount)
+# -----------------------------
+# Cálculos
+# -----------------------------
+dfc = df.copy()
 
-df_calc = df.copy()
+# Costo origen CLP
+dfc["Costo unit CLP (origen)"] = dfc.apply(lambda r: fx_to_clp(r["Moneda"], r["Costo unit"], usdclp, eurclp), axis=1)
+dfc["FOB CLP total"] = dfc["Costo unit CLP (origen)"] * dfc["Qty"]
 
-df_calc["Costo unit CLP"] = df_calc.apply(lambda r: fx_to_clp(r["Moneda"], r["Costo unit"]), axis=1)
-df_calc["FOB CLP total"] = df_calc["Costo unit CLP"] * df_calc["Qty"]
-df_calc["Ratio"] = df_calc["Formato"].apply(lambda x: compute_ratio(x, ratio_map))
-df_calc["Peso unidades"] = df_calc["Ratio"] * df_calc["Qty"]
+# Peso operativo
+dfc["Ratio"] = dfc["Formato"].apply(lambda x: compute_ratio(x, ratio_map))
+dfc["Peso unidades"] = dfc["Ratio"] * dfc["Qty"]
 
-total_qty = df_calc["Qty"].sum()
-total_fob = df_calc["FOB CLP total"].sum()
-total_peso_u = df_calc["Peso unidades"].sum()
+total_qty = int(dfc["Qty"].sum())
+total_fob = float(dfc["FOB CLP total"].sum())
+total_peso_u = float(dfc["Peso unidades"].sum())
 
-# Shared costs
-shipping_clp = (shipping_amount * (eurclp if shipping_currency == "EUR" else usdclp))
-shared_clp = float(shipping_clp + iva_import + derechos + servicios_aduana + iva_servicios + transporte_local + otros)
+# Shipping internacional en CLP
+shipping_clp = float(shipping_amount) * (eurclp if shipping_currency == "EUR" else usdclp)
 
-# Allocation shares
+# Separación IVA (landed sin IVA)
+shared_non_iva = float(shipping_clp + derechos + servicios_aduana + transporte_local + otros)
+shared_iva = float(iva_import + iva_servicios)
+
+# Shares prorrateo
 if alloc_method == "Peso":
-    denom = total_peso_u if total_peso_u else 1
-    df_calc["Share"] = df_calc["Peso unidades"] / denom
+    denom = total_peso_u if total_peso_u else 1.0
+    dfc["Share"] = dfc["Peso unidades"] / denom
 elif alloc_method == "Valor":
-    denom = total_fob if total_fob else 1
-    df_calc["Share"] = df_calc["FOB CLP total"] / denom
+    denom = total_fob if total_fob else 1.0
+    dfc["Share"] = dfc["FOB CLP total"] / denom
 elif alloc_method == "Cantidad":
-    denom = total_qty if total_qty else 1
-    df_calc["Share"] = df_calc["Qty"] / denom
+    denom = total_qty if total_qty else 1.0
+    dfc["Share"] = dfc["Qty"] / denom
 else:  # Híbrido 50/50
-    denom_w = total_peso_u if total_peso_u else 1
-    denom_v = total_fob if total_fob else 1
-    share_w = df_calc["Peso unidades"] / denom_w
-    share_v = df_calc["FOB CLP total"] / denom_v
-    df_calc["Share"] = 0.5 * share_w + 0.5 * share_v
+    denom_w = total_peso_u if total_peso_u else 1.0
+    denom_v = total_fob if total_fob else 1.0
+    share_w = dfc["Peso unidades"] / denom_w
+    share_v = dfc["FOB CLP total"] / denom_v
+    dfc["Share"] = 0.5 * share_w + 0.5 * share_v
 
-df_calc["Costos compartidos asignados"] = df_calc["Share"] * shared_clp
-df_calc["Landed CLP total"] = df_calc["FOB CLP total"] + df_calc["Costos compartidos asignados"]
-df_calc["Landed CLP unit"] = np.where(df_calc["Qty"] > 0, df_calc["Landed CLP total"] / df_calc["Qty"], 0)
+# Asignaciones
+dfc["Asignado compartidos sin IVA"] = dfc["Share"] * shared_non_iva
+dfc["Asignado IVA import/serv"] = dfc["Share"] * shared_iva
 
-# Pricing calculations
-df_calc["Precio base 2.2"] = df_calc["Costo unit CLP"] * float(mult_import)
-df_calc["Ajuste matriz %"] = df_calc.apply(
-    lambda r: matrix_adjustment(r["Origen"], r["Ratio"], r["Rotación"], r["Mercado"]),
+# Landed SIN IVA (requisito #1)
+dfc["Landed CLP total (sin IVA)"] = dfc["FOB CLP total"] + dfc["Asignado compartidos sin IVA"]
+dfc["Landed CLP unit (sin IVA)"] = np.where(dfc["Qty"] > 0, dfc["Landed CLP total (sin IVA)"] / dfc["Qty"], 0.0)
+
+# Landed CON IVA (para análisis de margen caja)
+dfc["Landed CLP total (con IVA)"] = dfc["Landed CLP total (sin IVA)"] + dfc["Asignado IVA import/serv"]
+dfc["Landed CLP unit (con IVA)"] = np.where(dfc["Qty"] > 0, dfc["Landed CLP total (con IVA)"] / dfc["Qty"], 0.0)
+
+# -------- Pricing escenarios --------
+# Ajuste matriz (%)
+dfc["Ajuste matriz %"] = dfc.apply(
+    lambda r: matrix_adjustment(r.get("Origen", ""), float(r["Ratio"]), r.get("Rotación", ""), r.get("Mercado", "")),
     axis=1
 )
-df_calc["Precio 2.2 + matriz"] = df_calc["Precio base 2.2"] * (1 + df_calc["Ajuste matriz %"])
 
-# Price to hit GM target on landed
-df_calc["Precio p/GM objetivo"] = np.where(
-    df_calc["Landed CLP unit"] > 0,
-    df_calc["Landed CLP unit"] / (1 - float(gm_target)),
-    0
+# Escenario A: MJ 1,7 + IVA sobre costo SIN IVA (default #2)
+dfc["Precio MJ (1,7+IVA)"] = dfc["Landed CLP unit (sin IVA)"] * float(mult_mj) * (1.0 + float(iva_cl))
+dfc["Precio MJ (1,7+IVA) ajustado"] = dfc["Precio MJ (1,7+IVA)"] * (1.0 + dfc["Ajuste matriz %"])
+
+# Escenario B: 2,2 sobre costo ORIGEN (como antes)
+dfc["Precio 2,2 (origen)"] = dfc["Costo unit CLP (origen)"] * float(mult_import)
+dfc["Precio 2,2 (origen) ajustado"] = dfc["Precio 2,2 (origen)"] * (1.0 + dfc["Ajuste matriz %"])
+
+# Escenario C: GM objetivo sobre landed SIN IVA
+dfc["Precio p/GM objetivo (sin IVA)"] = np.where(
+    dfc["Landed CLP unit (sin IVA)"] > 0,
+    dfc["Landed CLP unit (sin IVA)"] / (1.0 - float(gm_target)),
+    0.0
 )
 
-if pricing_mode == "Seguir fórmula base (2,2) + Matriz (ajuste)":
-    df_calc["Precio recomendado"] = df_calc["Precio 2.2 + matriz"]
-elif pricing_mode == "Proteger margen (GM objetivo sobre landed)":
-    df_calc["Precio recomendado"] = df_calc["Precio p/GM objetivo"]
+# Elegir recomendado según fórmula seleccionada
+if formula == "MJ 1,7 + IVA (default)":
+    dfc["Precio recomendado"] = dfc["Precio MJ (1,7+IVA) ajustado"]
+elif formula == "Importado 2,2 (IVA incl.)":
+    dfc["Precio recomendado"] = dfc["Precio 2,2 (origen) ajustado"]
+elif formula == "GM objetivo sobre landed (sin IVA)":
+    dfc["Precio recomendado"] = dfc["Precio p/GM objetivo (sin IVA)"]
 else:
-    df_calc["Precio recomendado"] = np.maximum(df_calc["Precio 2.2 + matriz"], df_calc["Precio p/GM objetivo"])
+    dfc["Precio recomendado"] = np.maximum(
+        dfc["Precio MJ (1,7+IVA) ajustado"],
+        np.maximum(dfc["Precio 2,2 (origen) ajustado"], dfc["Precio p/GM objetivo (sin IVA)"])
+    )
 
-df_calc["Precio recomendado redondeado"] = df_calc["Precio recomendado"].apply(lambda x: round_up(x, int(rounding_step)))
+# Redondeo a ...900 + sin decimales (#3 y #4)
+dfc["Precio recomendado (…900)"] = dfc["Precio recomendado"].apply(round_to_900_up).astype(int)
 
-# Diagnostics
-df_calc["GM real (sobre redondeado)"] = np.where(
-    df_calc["Precio recomendado redondeado"] > 0,
-    (df_calc["Precio recomendado redondeado"] - df_calc["Landed CLP unit"]) / df_calc["Precio recomendado redondeado"],
-    0
+# Versiones redondeadas de cada escenario (para resumen #5)
+dfc["Precio MJ (…900)"] = dfc["Precio MJ (1,7+IVA) ajustado"].apply(round_to_900_up).astype(int)
+dfc["Precio 2,2 (…900)"] = dfc["Precio 2,2 (origen) ajustado"].apply(round_to_900_up).astype(int)
+dfc["Precio GM (…900)"] = dfc["Precio p/GM objetivo (sin IVA)"].apply(round_to_900_up).astype(int)
+
+# GM real sobre el precio redondeado (sin IVA y con IVA)
+dfc["GM real % (sin IVA)"] = np.where(
+    dfc["Precio recomendado (…900)"] > 0,
+    (dfc["Precio recomendado (…900)"] - dfc["Landed CLP unit (sin IVA)"]) / dfc["Precio recomendado (…900)"],
+    0.0
 )
-df_calc["Brecha vs 2.2 (CLP)"] = df_calc["Precio recomendado redondeado"] - df_calc["Precio base 2.2"].apply(lambda x: round_up(x, int(rounding_step)))
-
-# Ordering / display
-display_cols = [
-    "Producto", "Formato", "Qty", "Moneda", "Costo unit",
-    "Costo unit CLP", "Landed CLP unit",
-    "Precio base 2.2", "Ajuste matriz %", "Precio 2.2 + matriz",
-    "Precio p/GM objetivo", "Precio recomendado redondeado",
-    "GM real (sobre redondeado)", "Brecha vs 2.2 (CLP)",
-    "Rotación", "Mercado"
-]
-for c in display_cols:
-    if c not in df_calc.columns:
-        df_calc[c] = ""
+dfc["GM real % (con IVA)"] = np.where(
+    dfc["Precio recomendado (…900)"] > 0,
+    (dfc["Precio recomendado (…900)"] - dfc["Landed CLP unit (con IVA)"]) / dfc["Precio recomendado (…900)"],
+    0.0
+)
 
 # -----------------------------
-# Output
+# Salida principal
 # -----------------------------
-st.divider()
 st.subheader("Resumen de importación")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("FOB total (CLP)", f"{total_fob:,.0f}".replace(",", "."))
-c2.metric("Costos compartidos (CLP)", f"{shared_clp:,.0f}".replace(",", "."))
-c3.metric("Landed total (CLP)", f"{df_calc['Landed CLP total'].sum():,.0f}".replace(",", "."))
-avg_gm = df_calc["GM real (sobre redondeado)"].replace([np.inf, -np.inf], np.nan).dropna()
-c4.metric("GM promedio (recomendado)", f"{(avg_gm.mean()*100 if len(avg_gm) else 0):.1f}%")
+landed_total_sin_iva = float(dfc["Landed CLP total (sin IVA)"].sum())
+landed_total_con_iva = float(dfc["Landed CLP total (con IVA)"].sum())
+total_shared = float(shared_non_iva + shared_iva)
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("FOB total (CLP)", f"{int(round(total_fob)):,}".replace(",", "."))
+c2.metric("Costos compartidos (CLP)", f"{int(round(total_shared)):,}".replace(",", "."))
+c3.metric("Landed total SIN IVA (CLP)", f"{int(round(landed_total_sin_iva)):,}".replace(",", "."))
+c4.metric("Landed total CON IVA (CLP)", f"{int(round(landed_total_con_iva)):,}".replace(",", "."))
+avg_gm = dfc["GM real % (sin IVA)"].replace([np.inf, -np.inf], np.nan).dropna()
+c5.metric("GM promedio (sin IVA)", f"{(avg_gm.mean()*100 if len(avg_gm) else 0):.1f}%")
 
 st.subheader("Detalle por producto (landed + precio sugerido)")
+
+# Mostrar sin decimales en CLP (#3)
+view = dfc.copy()
+for col in [
+    "Costo unit CLP (origen)",
+    "FOB CLP total",
+    "Landed CLP unit (sin IVA)",
+    "Landed CLP unit (con IVA)",
+]:
+    view[col] = view[col].round(0).astype(int)
+
+display_cols = [
+    "Producto", "Formato", "Qty", "Moneda", "Costo unit",
+    "Costo unit CLP (origen)", "Landed CLP unit (sin IVA)", "Landed CLP unit (con IVA)",
+    "Ajuste matriz %", "Precio MJ (…900)", "Precio 2,2 (…900)", "Precio GM (…900)",
+    "Precio recomendado (…900)",
+    "GM real % (sin IVA)", "GM real % (con IVA)",
+    "Rotación", "Mercado"
+]
+
 st.dataframe(
-    df_calc[display_cols].copy(),
+    view[display_cols],
     use_container_width=True,
     hide_index=True
 )
 
-# Downloads
+# -----------------------------
+# Resumen final (requisito #5)
+# -----------------------------
+st.divider()
+st.subheader("Resumen de la carga por escenario (venta total + margen)")
+
+def totals_for(price_col_900: str):
+    sales_total = int(np.sum(dfc[price_col_900].astype(int) * dfc["Qty"].astype(int)))
+    gm_sin = (sales_total - landed_total_sin_iva) / sales_total if sales_total > 0 else 0.0
+    gm_con = (sales_total - landed_total_con_iva) / sales_total if sales_total > 0 else 0.0
+    return sales_total, gm_sin, gm_con
+
+rows = []
+scenarios = [
+    ("MJ 1,7 + IVA (…900)", "Precio MJ (…900)"),
+    ("2,2 sobre origen (…900)", "Precio 2,2 (…900)"),
+    ("GM objetivo (…900)", "Precio GM (…900)"),
+    ("Recomendado actual (…900)", "Precio recomendado (…900)"),
+]
+
+for label, colp in scenarios:
+    sales_total, gm_sin, gm_con = totals_for(colp)
+    rows.append({
+        "Escenario": label,
+        "Venta total (CLP)": sales_total,
+        "Margen % (sin IVA)": round(gm_sin * 100, 1),
+        "Margen % (con IVA)": round(gm_con * 100, 1),
+    })
+
+summary_df = pd.DataFrame(rows)
+st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+# Mostrar también costo total de la carga (sin/con IVA)
+c6, c7 = st.columns(2)
+c6.metric("Costo total carga (Landed SIN IVA)", f"{int(round(landed_total_sin_iva)):,}".replace(",", "."))
+c7.metric("Costo total carga (Landed CON IVA)", f"{int(round(landed_total_con_iva)):,}".replace(",", "."))
+
+# -----------------------------
+# Exportar
+# -----------------------------
 st.subheader("Exportar")
-out_csv = df_calc[display_cols].to_csv(index=False).encode("utf-8")
+
+export_cols = [
+    "Producto", "Formato", "Qty", "Moneda", "Costo unit",
+    "Costo unit CLP (origen)", "Landed CLP unit (sin IVA)", "Landed CLP unit (con IVA)",
+    "Precio MJ (…900)", "Precio 2,2 (…900)", "Precio GM (…900)",
+    "Precio recomendado (…900)",
+    "GM real % (sin IVA)", "GM real % (con IVA)",
+    "Rotación", "Mercado"
+]
+
+export_df = dfc.copy()
+# redondear/clpear a enteros donde corresponde
+export_df["Costo unit CLP (origen)"] = export_df["Costo unit CLP (origen)"].round(0).astype(int)
+export_df["Landed CLP unit (sin IVA)"] = export_df["Landed CLP unit (sin IVA)"].round(0).astype(int)
+export_df["Landed CLP unit (con IVA)"] = export_df["Landed CLP unit (con IVA)"].round(0).astype(int)
+export_df["GM real % (sin IVA)"] = export_df["GM real % (sin IVA)"].round(4)
+export_df["GM real % (con IVA)"] = export_df["GM real % (con IVA)"].round(4)
+
+out_csv = export_df[export_cols].to_csv(index=False).encode("utf-8")
 st.download_button(
     "Descargar CSV",
     data=out_csv,
-    file_name="pricing_mj_importacion.csv",
+    file_name="pricing_mj_importacion_v2.csv",
     mime="text/csv"
 )
 
-st.caption("Tip: si quieres usar esto para WooCommerce, agrega una columna Barcode/SKU en la tabla pegada y se exportará igual.")
-
+st.caption("Notas: Landed SIN IVA excluye IVA importación y el IVA de servicios (recuperables como crédito). "
+           "El resumen muestra márgenes vs landed SIN IVA y vs landed CON IVA (flujo de caja).")
