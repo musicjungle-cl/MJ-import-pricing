@@ -115,4 +115,105 @@ def fx(currency, amount):
     if pd.isna(amount): return np.nan
     c = (currency or "").upper()
     if c == "EUR": return amount * eurclp
-    if
+    if c == "USD": return amount * usdclp
+    return amount
+
+dfc = df.copy()
+dfc["Costo unit CLP"] = dfc.apply(lambda r: fx(r["Moneda"], r["Costo unit"]), axis=1)
+dfc["FOB CLP"] = dfc["Costo unit CLP"] * dfc["Qty"]
+
+# pesos operativos
+dfc["Ratio"] = dfc["Formato"].map(RATIOS).fillna(1.0)
+dfc["Peso op"] = dfc["Ratio"] * dfc["Qty"]
+
+total_fob = float(dfc["FOB CLP"].sum())
+total_peso = float(dfc["Peso op"].sum()) if float(dfc["Peso op"].sum()) else 1.0
+
+# shipping origen -> CLP (si moneda mixta, asumimos shipping en EUR si hay EUR, si no USD)
+currs = [c for c in dfc["Moneda"].unique().tolist() if c]
+ship_curr = "EUR" if "EUR" in currs else ("USD" if "USD" in currs else "EUR")
+ship_origin_clp = ship_origin * (eurclp if ship_curr == "EUR" else usdclp)
+
+# Reglas prorrateo fijas:
+# - shipping origen + proceso => por peso
+# - derechos + IVA import + IVA agente => por valor
+shared_peso = ship_origin_clp + float(proceso)
+shared_valor = float(derechos) + float(iva_import) + float(iva_agente)
+
+dfc["Share peso"] = dfc["Peso op"] / total_peso
+dfc["Share valor"] = np.where(total_fob > 0, dfc["FOB CLP"] / total_fob, 0.0)
+
+dfc["Asignado (peso)"] = dfc["Share peso"] * shared_peso
+dfc["Asignado (valor)"] = dfc["Share valor"] * shared_valor
+
+# Landed SIN IVA: incluye FOB + asignado peso + asignado derechos
+# (IVA importación y IVA agente NO se incluyen en landed sin IVA)
+dfc["Asignado derechos"] = dfc["Share valor"] * float(derechos)
+dfc["Landed unit sin IVA"] = np.where(
+    dfc["Qty"] > 0,
+    (dfc["FOB CLP"] + dfc["Asignado (peso)"] + dfc["Asignado derechos"]) / dfc["Qty"],
+    0.0
+)
+dfc["Landed total sin IVA"] = dfc["Landed unit sin IVA"] * dfc["Qty"]
+
+# Pricing (IVA incluido + ...900)
+def price(mult):
+    return (dfc["Landed unit sin IVA"] * mult * (1 + IVA_CL)).apply(round_900_up).astype(int)
+
+dfc["Precio oferta (1,5)"] = price(1.5)
+dfc["Precio MJ (1,7)"] = price(1.7)
+dfc["Precio protegido (2,2)"] = price(2.2)
+
+dfc["Total ítem oferta"] = (dfc["Precio oferta (1,5)"] * dfc["Qty"]).astype(int)
+dfc["Total ítem MJ"] = (dfc["Precio MJ (1,7)"] * dfc["Qty"]).astype(int)
+dfc["Total ítem protegido"] = (dfc["Precio protegido (2,2)"] * dfc["Qty"]).astype(int)
+
+# --- Outputs ---
+st.subheader("3) Tabla de resultados")
+
+out = dfc[[
+    "Producto","Formato","Qty","Moneda","Costo unit",
+    "Costo unit CLP","Landed unit sin IVA","Landed total sin IVA",
+    "Precio oferta (1,5)","Total ítem oferta",
+    "Precio MJ (1,7)","Total ítem MJ",
+    "Precio protegido (2,2)","Total ítem protegido",
+]].copy()
+
+# CLP sin decimales
+for c in ["Costo unit CLP","Landed unit sin IVA","Landed total sin IVA"]:
+    out[c] = out[c].round(0).astype(int)
+
+# Fila total
+total_row = {c:"" for c in out.columns}
+total_row["Producto"] = "TOTAL"
+total_row["Qty"] = int(out["Qty"].sum())
+total_row["Landed total sin IVA"] = int(out["Landed total sin IVA"].sum())
+total_row["Total ítem oferta"] = int(out["Total ítem oferta"].sum())
+total_row["Total ítem MJ"] = int(out["Total ítem MJ"].sum())
+total_row["Total ítem protegido"] = int(out["Total ítem protegido"].sum())
+out = pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
+
+st.dataframe(out, use_container_width=True, hide_index=True)
+
+st.subheader("4) Wrap-up de la carga (costo vs ingresos)")
+
+landed_total = float(dfc["Landed total sin IVA"].sum())
+sales_oferta = float(dfc["Total ítem oferta"].sum())
+sales_mj = float(dfc["Total ítem MJ"].sum())
+sales_prot = float(dfc["Total ítem protegido"].sum())
+
+c1,c2,c3,c4 = st.columns(4)
+c1.metric("Costo total carga (sin IVA)", f"{int(landed_total):,}".replace(",", "."))
+c2.metric("Ingresos oferta (1,5)", f"{int(sales_oferta):,}".replace(",", "."))
+c3.metric("Ingresos MJ (1,7)", f"{int(sales_mj):,}".replace(",", "."))
+c4.metric("Ingresos protegido (2,2)", f"{int(sales_prot):,}".replace(",", "."))
+
+st.caption("Margen % aquí es económico (sobre costo sin IVA).")
+m5,m6,m7 = st.columns(3)
+m5.metric("Margen % oferta", f"{((sales_oferta - landed_total)/sales_oferta*100 if sales_oferta else 0):.1f}%")
+m6.metric("Margen % MJ", f"{((sales_mj - landed_total)/sales_mj*100 if sales_mj else 0):.1f}%")
+m7.metric("Margen % protegido", f"{((sales_prot - landed_total)/sales_prot*100 if sales_prot else 0):.1f}%")
+
+# Export
+csv = out.to_csv(index=False).encode("utf-8")
+st.download_button("Descargar CSV", data=csv, file_name="mj_import_pricing_mvp.csv", mime="text/csv")
